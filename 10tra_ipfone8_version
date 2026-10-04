@@ -1,0 +1,624 @@
+# app.py
+# Трекер тренировок — MVP на стандартной библиотеке Python
+# Запуск: python app.py
+
+import http.server
+import socketserver
+import sqlite3
+import json
+import threading
+import webbrowser
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+DB_PATH = "fitness.db"
+HOST = "127.0.0.1"
+START_PORT = 8000
+
+
+# ------------------------- База данных -------------------------
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def init_db():
+    con = db()
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS workouts(
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            name    TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS schedule(
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            day        TEXT NOT NULL,               -- YYYY-MM-DD
+            time       TEXT NOT NULL DEFAULT '',    -- HH:MM
+            workout_id INTEGER NOT NULL
+                       REFERENCES workouts(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS reminders(
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            title    TEXT NOT NULL,
+            due      TEXT NOT NULL,                 -- YYYY-MM-DDTHH:MM
+            notified INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    con.commit()
+    con.close()
+
+
+# ------------------------- HTML страница -------------------------
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#ffffff">
+<title>Тренировки</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;width:100%;overflow-x:hidden}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:#fafafa;color:#1a1a1a;font-size:15px;line-height:1.5;
+  padding-top:env(safe-area-inset-top);
+  padding-bottom:env(safe-area-inset-bottom);
+  -webkit-text-size-adjust:100%;
+}
+
+/* Header — компактнее, перенос на узком экране */
+header{
+  padding:12px 16px;border-bottom:1px solid #ececec;background:#fff;
+  display:flex;flex-direction:column;gap:10px;
+  position:sticky;top:0;z-index:10;
+}
+h1{font-size:12px;margin:0;font-weight:700;letter-spacing:2px}
+h2{font-size:15px;font-weight:600;margin:0 0 12px}
+nav{display:flex;gap:2px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+nav button{
+  background:none;border:0;color:#888;font:inherit;font-size:13px;
+  cursor:pointer;padding:8px 12px;border-radius:6px;white-space:nowrap;
+  min-height:36px;
+}
+nav button.active{color:#1a1a1a;background:#f0f0f0}
+
+main{max-width:100%;margin:0 auto;padding:16px}
+section{display:none}
+section.active{display:block}
+
+/* Поля ввода — крупнее под палец */
+input,textarea,select{
+  width:100%;padding:12px 12px;border:1px solid #e2e2e2;border-radius:8px;
+  background:#fff;font:inherit;font-size:16px;   /* 16px — Safari не зумит при фокусе */
+  color:inherit;outline:none;min-height:44px;
+  -webkit-appearance:none;appearance:none;
+}
+input:focus,textarea:focus,select:focus{border-color:#999}
+textarea{resize:vertical;min-height:100px}
+/* Вернуть нативный вид для полей даты/времени — иначе iOS не откроет пикер */
+input[type=time],
+input[type=datetime-local],
+input[type=date]{
+  -webkit-appearance:auto;
+  appearance:auto;
+}
+/* Кнопки — минимум 44 px по высоте (гайдлайны Apple) */
+button{
+  font:inherit;font-size:15px;cursor:pointer;padding:12px 18px;
+  border-radius:8px;border:1px solid #1a1a1a;background:#1a1a1a;color:#fff;
+  min-height:44px;touch-action:manipulation;
+}
+button.ghost{background:none;color:#999;border-color:#e2e2e2}
+button.ghost:active{color:#c0392b;border-color:#e8bcbc}
+
+form{display:flex;flex-direction:column;gap:10px;margin-bottom:20px}
+
+.card{
+  border:1px solid #ececec;border-radius:9px;padding:12px 14px;background:#fff;
+  margin-bottom:8px;display:flex;justify-content:space-between;gap:10px;
+  align-items:flex-start;
+}
+.card h3{margin:0;font-size:14px;font-weight:600;word-break:break-word}
+.card p{margin:6px 0 0;color:#888;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.card button{padding:8px 12px;font-size:13px;flex-shrink:0;min-height:36px}
+.empty{color:#aaa;font-size:14px}
+
+/* Календарь */
+.calhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.calhead h2{margin:0;text-transform:capitalize;font-size:15px}
+.calhead button{padding:8px 14px;min-height:40px;min-width:44px}
+
+.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.dow{text-align:center;font-size:10px;color:#aaa;padding:4px 0;letter-spacing:1px}
+
+/* Ячейка дня: на 375 px ширина ≈ 48 px, делаем компактной */
+.day{
+  min-height:62px;border:1px solid #ececec;border-radius:6px;padding:4px;
+  background:#fff;font-size:11px;cursor:pointer;
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.day:active{border-color:#bbb;background:#fafafa}
+.day.empty{visibility:hidden;border:0}
+.day.today{border-color:#1a1a1a}
+.day .num{color:#aaa;font-size:10px;margin-bottom:2px;flex-shrink:0}
+.ev{
+  background:#f2f2f2;border-radius:3px;padding:1px 4px;margin-top:1px;
+  font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+.hidden{display:none}
+.panel{margin-top:20px;border-top:1px solid #ececec;padding-top:16px}
+
+/* Форма добавления тренировки в день — на iPhone лучше столбиком */
+.panel form{flex-direction:column;align-items:stretch;gap:10px}
+.panel form select,
+.panel form input[type=time],
+.panel form button{width:100%}
+
+/* Чуть больше отступы в горизонтали на широких экранах (iPhone Plus, iPad) */
+@media (min-width:414px){
+  main{padding:20px}
+  header{padding:14px 20px}
+  .day{min-height:72px}
+  .ev{font-size:11px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ТРЕНИРОВКИ</h1>
+  <nav>
+    <button data-tab="workouts" class="active">Программы</button>
+    <button data-tab="calendar">Календарь</button>
+    <button data-tab="reminders">Напоминания</button>
+  </nav>
+</header>
+
+<main>
+  <section id="workouts" class="active">
+    <h2>Мои программы</h2>
+    <form id="wForm">
+      <input name="name" placeholder="Название программы" required>
+      <textarea name="details" placeholder="Упражнения (одно на строку)"></textarea>
+      <button type="submit">Добавить программу</button>
+    </form>
+    <div id="wList"></div>
+  </section>
+
+  <section id="calendar">
+    <div class="calhead">
+      <button class="ghost" id="prevM">←</button>
+      <h2 id="monthLabel"></h2>
+      <button class="ghost" id="nextM">→</button>
+    </div>
+    <div class="grid" id="dowRow"></div>
+    <div class="grid" id="calGrid"></div>
+    <div id="dayPanel" class="panel hidden"></div>
+  </section>
+
+  <section id="reminders">
+    <h2>Напоминания</h2>
+    <form id="rForm">
+      <input name="title" placeholder="О чём напомнить" required>
+      <input type="datetime-local" name="due" required>
+      <button type="submit">Добавить напоминание</button>
+    </form>
+    <div id="rList"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '')
+  .split('&').join('&amp;')
+  .split('<').join('&lt;')
+  .split('>').join('&gt;')
+  .split('"').join('&quot;');
+
+async function api(path, method, body){
+  const r = await fetch(path, {
+    method: method || 'GET',
+    headers: body ? {'Content-Type':'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) {
+    let msg = 'Ошибка';
+    try { msg = (await r.json()).error || msg; } catch(e){}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+/* ---------- Вкладки ---------- */
+document.querySelectorAll('nav button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    $('#' + b.dataset.tab).classList.add('active');
+    if (b.dataset.tab === 'calendar') loadCalendar();
+    if (b.dataset.tab === 'reminders') loadReminders();
+  };
+});
+
+/* ---------- Программы тренировок ---------- */
+async function loadWorkouts(){
+  const list = await api('/api/workouts');
+  $('#wList').innerHTML = list.length ? list.map(w => `
+    <div class="card">
+      <div><h3>${esc(w.name)}</h3>${w.details ? `<p>${esc(w.details)}</p>` : ''}</div>
+      <button class="ghost" onclick="delWorkout(${w.id})">Удалить</button>
+    </div>`).join('') : '<p class="empty">Пока нет программ</p>';
+}
+
+window.delWorkout = async id => {
+  await api('/api/workouts/' + id, 'DELETE');
+  loadWorkouts(); loadCalendar();
+};
+
+$('#wForm').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  await api('/api/workouts', 'POST', { name: f.name.value, details: f.details.value });
+  f.reset();
+  loadWorkouts();
+};
+
+/* ---------- Календарь ---------- */
+let cur = new Date();
+let workoutsCache = [];
+let selectedDay = null;
+
+const DOW = ['ПН','ВТ','СР','ЧТ','ПТ','СБ','ВС'];
+$('#dowRow').innerHTML = DOW.map(d => `<div class="dow">${d}</div>`).join('');
+
+function ymd(d){
+  return d.getFullYear() + '-' +
+         String(d.getMonth()+1).padStart(2,'0') + '-' +
+         String(d.getDate()).padStart(2,'0');
+}
+
+async function loadCalendar(){
+  workoutsCache = await api('/api/workouts');
+
+  const y = cur.getFullYear(), m = cur.getMonth();
+  const monthStr = y + '-' + String(m+1).padStart(2,'0');
+  $('#monthLabel').textContent = cur.toLocaleDateString('ru', {month:'long', year:'numeric'});
+
+  const events = await api('/api/schedule?month=' + monthStr);
+  const byDay = {};
+  events.forEach(e => { (byDay[e.day] = byDay[e.day] || []).push(e); });
+
+  const first = new Date(y, m, 1);
+  const offset = (first.getDay() + 6) % 7;          // неделя с понедельника
+  const days = new Date(y, m+1, 0).getDate();
+  const todayStr = ymd(new Date());
+
+  let html = '';
+  for (let i = 0; i < offset; i++) html += '<div class="day empty"></div>';
+  for (let d = 1; d <= days; d++){
+    const ds = y + '-' + String(m+1).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+    const evs = byDay[ds] || [];
+    html += `<div class="day ${ds === todayStr ? 'today' : ''}" data-day="${ds}">
+      <div class="num">${d}</div>
+      ${evs.map(e => `<div class="ev" title="${esc(e.name)}">${e.time ? esc(e.time) + ' ' : ''}${esc(e.name)}</div>`).join('')}
+    </div>`;
+  }
+  $('#calGrid').innerHTML = html;
+  document.querySelectorAll('.day[data-day]').forEach(el => {
+    el.onclick = () => openDay(el.dataset.day);
+  });
+}
+
+async function openDay(day){
+  selectedDay = day;
+  const evs = await api('/api/schedule?day=' + day);
+  const opts = workoutsCache.map(w => `<option value="${w.id}">${esc(w.name)}</option>`).join('');
+
+  const list = evs.length ? evs.map(e => `
+    <div class="card">
+      <div><h3>${e.time ? esc(e.time) + ' — ' : ''}${esc(e.name)}</h3></div>
+      <button class="ghost" onclick="delEvent(${e.id})">Удалить</button>
+    </div>`).join('') : '<p class="empty">Нет тренировок в этот день</p>';
+
+  const d = new Date(day + 'T00:00:00');
+  const panel = $('#dayPanel');
+  panel.innerHTML = `
+    <h2>${d.toLocaleDateString('ru', {day:'numeric', month:'long', year:'numeric'})}</h2>
+    ${list}
+    ${workoutsCache.length ? `
+      <form id="dayForm">
+        <select name="workout_id">${opts}</select>
+        <input type="time" name="time" value="18:00">
+        <button type="submit">Добавить</button>
+      </form>` : '<p class="empty">Сначала создайте программу во вкладке «Программы»</p>'}
+  `;
+  panel.classList.remove('hidden');
+
+  const f = $('#dayForm');
+  if (f) f.onsubmit = async e => {
+    e.preventDefault();
+    await api('/api/schedule', 'POST', {
+      day: day,
+      time: f.elements['time'].value,
+      workout_id: f.elements['workout_id'].value
+});
+    await loadCalendar();
+    openDay(day);
+  };
+}
+
+window.delEvent = async id => {
+  await api('/api/schedule/' + id, 'DELETE');
+  await loadCalendar();
+  if (selectedDay) openDay(selectedDay);
+};
+
+$('#prevM').onclick = () => { cur.setMonth(cur.getMonth() - 1); loadCalendar(); };
+$('#nextM').onclick = () => { cur.setMonth(cur.getMonth() + 1); loadCalendar(); };
+
+/* ---------- Напоминания ---------- */
+async function loadReminders(){
+  const list = await api('/api/reminders');
+  $('#rList').innerHTML = list.length ? list.map(r => {
+    const dt = new Date(r.due);
+    return `<div class="card">
+      <div>
+        <h3>${esc(r.title)}</h3>
+        <p>${dt.toLocaleString('ru', {day:'numeric', month:'long', hour:'2-digit', minute:'2-digit'})}${r.notified ? ' · отправлено' : ''}</p>
+      </div>
+      <button class="ghost" onclick="delReminder(${r.id})">Удалить</button>
+    </div>`;
+  }).join('') : '<p class="empty">Пока нет напоминаний</p>';
+}
+
+window.delReminder = async id => {
+  await api('/api/reminders/' + id, 'DELETE');
+  loadReminders();
+};
+
+$('#rForm').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  await api('/api/reminders', 'POST', { title: f.title.value, due: f.due.value });
+  f.reset();
+  loadReminders();
+};
+
+
+/* ---------- Оповещения ---------- */
+if ('Notification' in window && Notification.permission === 'default'){
+  Notification.requestPermission();
+}
+
+async function pollNotifications(){
+  try {
+    const due = await api('/api/notifications');
+    if (!due.length) return;
+
+    if ('Notification' in window && Notification.permission === 'granted'){
+      due.forEach(r => new Notification('Тренировка', { body: r.title }));
+    } else {
+      alert('Напоминания:\n' + due.map(r => '• ' + r.title).join('\n'));
+    }
+    loadReminders();
+  } catch(e) { /* сервер недоступен — молча ждём */ }
+}
+
+/* ---------- Инициализация ---------- */
+loadWorkouts();
+loadCalendar();
+loadReminders();
+setInterval(pollNotifications, 15000);
+pollNotifications();
+</script>
+</body>
+</html>
+"""
+
+
+# ------------------------- HTTP обработчик -------------------------
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        pass  # тихий лог
+
+    # ---- утилиты ----
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    # ---- GET ----
+    def do_GET(self):
+        u = urlparse(self.path)
+        p, qs = u.path, parse_qs(u.query)
+
+        if p == "/":
+            return self._send(200, HTML_PAGE, "text/html")
+
+        if p == "/api/workouts":
+            con = db()
+            try:
+                rows = [dict(r) for r in con.execute("SELECT * FROM workouts ORDER BY id DESC")]
+            finally:
+                con.close()
+            return self._send(200, rows)
+
+        if p == "/api/schedule":
+            con = db()
+            try:
+                if "day" in qs:
+                    rows = [dict(r) for r in con.execute("""
+                        SELECT s.id, s.day, s.time, s.workout_id, w.name
+                        FROM schedule s JOIN workouts w ON w.id = s.workout_id
+                        WHERE s.day = ? ORDER BY s.time
+                    """, (qs["day"][0],))]
+                else:
+                    month = qs.get("month", [""])[0]
+                    rows = [dict(r) for r in con.execute("""
+                        SELECT s.id, s.day, s.time, s.workout_id, w.name
+                        FROM schedule s JOIN workouts w ON w.id = s.workout_id
+                        WHERE s.day LIKE ? ORDER BY s.day, s.time
+                    """, (month + "%",))]
+            finally:
+                con.close()
+            return self._send(200, rows)
+
+        if p == "/api/reminders":
+            con = db()
+            try:
+                rows = [dict(r) for r in con.execute("SELECT * FROM reminders ORDER BY due")]
+            finally:
+                con.close()
+            return self._send(200, rows)
+
+        if p == "/api/notifications":
+            now = datetime.now().strftime("%Y-%m-%dT%H:%M")
+            con = db()
+            try:
+                rows = [dict(r) for r in con.execute(
+                    "SELECT id, title, due FROM reminders WHERE notified = 0 AND due <= ?", (now,))]
+                for r in rows:
+                    con.execute("UPDATE reminders SET notified = 1 WHERE id = ?", (r["id"],))
+                con.commit()
+            finally:
+                con.close()
+            return self._send(200, rows)
+
+        return self._send(404, {"error": "not found"})
+
+    # ---- POST ----
+    def do_POST(self):
+        p = urlparse(self.path).path
+        data = self._read_json()
+        con = db()
+        try:
+            if p == "/api/workouts":
+                name = (data.get("name") or "").strip()
+                if not name:
+                    return self._send(400, {"error": "Введите название программы"})
+                cur = con.execute("INSERT INTO workouts(name, details) VALUES(?, ?)",
+                                  (name, (data.get("details") or "").strip()))
+                con.commit()
+                return self._send(200, {"id": cur.lastrowid})
+
+            if p == "/api/schedule":
+                day = (data.get("day") or "").strip()
+                wid = data.get("workout_id")
+                if not day or not wid:
+                    return self._send(400, {"error": "Нужны дата и тренировка"})
+
+                # Фикс А: отсекаем мусор и неположительные ID
+                try:
+                    wid = int(wid)
+                    if wid <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "Некорректный ID тренировки"})
+
+                # Фикс Б: ловим нарушение внешнего ключа (несуществующая программа)
+                try:
+                    cur = con.execute(
+                        "INSERT INTO schedule(day, time, workout_id) VALUES(?, ?, ?)",
+                        (day, (data.get("time") or "").strip(), wid),
+                    )
+                    con.commit()
+                except sqlite3.IntegrityError:
+                    return self._send(400, {"error": "Такой программы не существует"})
+
+                return self._send(200, {"id": cur.lastrowid})
+
+            if p == "/api/reminders":
+                title = (data.get("title") or "").strip()
+                due = (data.get("due") or "").strip()
+                if not title or not due:
+                    return self._send(400, {"error": "Нужны заголовок и время"})
+                cur = con.execute("INSERT INTO reminders(title, due, notified) VALUES(?, ?, 0)",
+                                  (title, due))
+                con.commit()
+                return self._send(200, {"id": cur.lastrowid})
+        finally:
+            con.close()
+        return self._send(404, {"error": "not found"})
+
+    # ---- DELETE ----
+    def do_DELETE(self):
+        parts = urlparse(self.path).path.strip("/").split("/")
+        tables = {"workouts": "workouts", "schedule": "schedule", "reminders": "reminders"}
+        if len(parts) == 3 and parts[0] == "api" and parts[1] in tables:
+            try:
+                row_id = int(parts[2])
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "Некорректный ID"})
+
+            con = db()
+            try:
+                con.execute(f"DELETE FROM {tables[parts[1]]} WHERE id = ?", (row_id,))
+                con.commit()
+            finally:
+                con.close()
+            return self._send(200, {"ok": True})
+
+        return self._send(404, {"error": "not found"})
+
+
+# ------------------------- Запуск -------------------------
+
+class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    init_db()
+
+    port = START_PORT
+    srv = None
+    for _ in range(20):
+        try:
+            srv = ThreadingServer((HOST, port), Handler)
+            break
+        except OSError:
+            port += 1
+    if srv is None:
+        print("Не удалось занять порт")
+        return
+
+    url = "http://%s:%d/" % (HOST, port)
+    print("Сервер запущен:", url)
+    print("Ctrl+C для остановки")
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nОстановлено")
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
